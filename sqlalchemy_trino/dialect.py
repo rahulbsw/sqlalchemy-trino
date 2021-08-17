@@ -7,6 +7,7 @@ from sqlalchemy.engine.base import Connection
 from sqlalchemy.engine.default import DefaultDialect, DefaultExecutionContext
 from sqlalchemy.engine.url import URL
 from trino.auth import BasicAuthentication
+#from trino.auth import JWTAuthentication
 from trino.client import TrinoQuery
 from trino.dbapi import Cursor
 
@@ -62,6 +63,9 @@ class TrinoDialect(DefaultDialect):
     supports_multivalues_insert = True
     postfetch_lastrowid = False
 
+    #default catalog and schema
+    default_catalog = None
+
     # Version parser
     __version_pattern = re.compile(r'(\d+).*')
 
@@ -74,7 +78,6 @@ class TrinoDialect(DefaultDialect):
 
     def create_connect_args(self, url: URL) -> Tuple[List[Any], Dict[str, Any]]:
         args, kwargs = super(TrinoDialect, self).create_connect_args(url)  # type: List[Any], Dict[str, Any]
-
         db_parts = kwargs.pop('database', 'system').split('/')
         if len(db_parts) == 1:
             kwargs['catalog'] = db_parts[0]
@@ -88,10 +91,28 @@ class TrinoDialect(DefaultDialect):
         kwargs['user'] = username
 
         password = kwargs.pop('password', None)
+        
         if password:
             kwargs['http_scheme'] = 'https'
             kwargs['auth'] = BasicAuthentication(username, password)
+        # else:
+        #     jwt_token = kwargs.pop('jwt_token', None)
+        #     if jwt_token:
+        #         kwargs['http_scheme'] = 'https'
+        #         kwargs['auth'] = JWTAuthentication(jwt_token)    
 
+        if kwargs.get('http_scheme') == 'https':
+            verfiy = kwargs.pop('verfiy', None)
+            if verfiy:
+                kwargs['verfiy'] = verfiy
+            if not kwargs.get('port'):
+                kwargs['port'] = 443
+
+        kwargs.update(url.query)
+
+        # self._cache_column_metadata = kwargs.get('cache_column_metadata',
+        #                                        "false").lower() == 'true'
+        self.default_catalog=kwargs['catalog']
         return args, kwargs
 
     def get_columns(self, connection: Connection,
@@ -103,17 +124,17 @@ class TrinoDialect(DefaultDialect):
     def _get_columns(self, connection: Connection,
                      table_name: str, schema: str = None, **kw) -> List[Dict[str, Any]]:
         schema = schema or self._get_default_schema_name(connection)
-        query = dedent('''
+        query = dedent(f'''
             SELECT
                 "column_name",
                 "column_default",
                 "is_nullable",
                 "data_type"
-            FROM "information_schema"."columns"
-            WHERE "table_schema" = :schema AND "table_name" = :table
+            FROM "{self.default_catalog}"."information_schema"."columns"
+            WHERE "table_schema" = '{schema}' AND "table_name" = '{table_name}'
             ORDER BY "ordinal_position" ASC
         ''').strip()
-        res = connection.execute(sql.text(query), schema=schema, table=table_name)
+        res = connection.execute(sql.text(query))
         columns = []
         for record in res:
             column = dict(
@@ -141,16 +162,21 @@ class TrinoDialect(DefaultDialect):
         return []
 
     def get_schema_names(self, connection: Connection, **kw) -> List[str]:
-        query = 'SHOW SCHEMAS'
+        query = f'SHOW SCHEMAS FROM {self.default_catalog}' 
         res = connection.execute(sql.text(query))
         return [row.Schema for row in res]
 
     def get_table_names(self, connection: Connection, schema: str = None, **kw) -> List[str]:
-        query = 'SHOW TABLES'
-        if schema:
-            query = f'{query} FROM {self.identifier_preparer.quote_identifier(schema)}'
+        schema = schema or self._get_default_schema_name(connection)
+        if schema is None:
+            raise exc.NoSuchTableError('schema is required')
+        query = dedent(f'''
+            SELECT "table_name"
+            FROM "{self.default_catalog}"."information_schema"."tables"
+            WHERE "table_schema" = '{schema}'
+        ''').strip()
         res = connection.execute(sql.text(query))
-        return [row.Table for row in res]
+        return [row.table_name for row in res]
 
     def get_temp_table_names(self, connection: Connection, schema: str = None, **kw) -> List[str]:
         """Trino has no support for temporary tables. Returns an empty list."""
@@ -160,12 +186,12 @@ class TrinoDialect(DefaultDialect):
         schema = schema or self._get_default_schema_name(connection)
         if schema is None:
             raise exc.NoSuchTableError('schema is required')
-        query = dedent('''
+        query = dedent(f'''
             SELECT "table_name"
-            FROM "information_schema"."views"
-            WHERE "table_schema" = :schema
+            FROM "{self.default_catalog}"."information_schema"."views"
+            WHERE "table_schema" = '{schema}'
         ''').strip()
-        res = connection.execute(sql.text(query), schema=schema)
+        res = connection.execute(sql.text(query))
         return [row.table_name for row in res]
 
     def get_temp_view_names(self, connection: Connection, schema: str = None, **kw) -> List[str]:
@@ -173,7 +199,8 @@ class TrinoDialect(DefaultDialect):
         return []
 
     def get_view_definition(self, connection: Connection, view_name: str, schema: str = None, **kw) -> str:
-        full_view = self._get_full_table(view_name, schema)
+        schema=self._get_full_schema_name(schema,connection)
+        full_view = self._get_full_table(view_name, schema,quote=False)
         query = f'SHOW CREATE VIEW {full_view}'
         try:
             res = connection.execute(sql.text(query))
@@ -186,13 +213,14 @@ class TrinoDialect(DefaultDialect):
             ):
                 raise exc.NoSuchTableError(full_view) from e
             raise
+        #return dict(text=None)
 
     def get_indexes(self, connection: Connection,
                     table_name: str, schema: str = None, **kw) -> List[Dict[str, Any]]:
         if not self.has_table(connection, table_name, schema):
             raise exc.NoSuchTableError(f'schema={schema}, table={table_name}')
 
-        partitioned_columns = self._get_columns(connection, f'{table_name}$partitions', schema, **kw)
+        partitioned_columns = self._get_columns(connection, self.identifier_preparer.quote_identifier(f'{table_name}$partitions'), schema, **kw)
         partition_index = dict(
             name='partition',
             column_names=[col['name'] for col in partitioned_columns],
@@ -212,7 +240,8 @@ class TrinoDialect(DefaultDialect):
 
     def get_table_comment(self, connection: Connection,
                           table_name: str, schema: str = None, **kw) -> Dict[str, Any]:
-        properties_table = self._get_full_table(f"{table_name}$properties", schema)
+        schema=self._get_full_schema_name(schema,connection)        
+        properties_table = self._get_full_table(self.identifier_preparer.quote_identifier(f"{table_name}$properties"), schema,quote=False)
         query = f'SELECT "comment" FROM {properties_table}'
         try:
             res = connection.execute(sql.text(query))
@@ -226,9 +255,10 @@ class TrinoDialect(DefaultDialect):
             ):
                 return dict(text=None)
             raise
+        #return dict(text=None)
 
     def has_schema(self, connection: Connection, schema: str) -> bool:
-        query = f"SHOW SCHEMAS LIKE '{schema}'"
+        query = f"SHOW SCHEMAS FROM \"{self.default_catalog}\" LIKE '{schema}'"
         try:
             res = connection.execute(sql.text(query))
             return res.first() is not None
@@ -241,11 +271,10 @@ class TrinoDialect(DefaultDialect):
                 return False
             raise
 
+    
     def has_table(self, connection: Connection,
                   table_name: str, schema: str = None) -> bool:
-        query = 'SHOW TABLES'
-        if schema:
-            query = f'{query} FROM {self.identifier_preparer.quote_identifier(schema)}'
+        query = f'SHOW TABLES FROM {self._get_full_schema_name(schema,connection)}'
         query = f"{query} LIKE '{table_name}'"
         try:
             res = connection.execute(sql.text(query))
@@ -266,15 +295,30 @@ class TrinoDialect(DefaultDialect):
         return False
 
     def _get_server_version_info(self, connection: Connection) -> Tuple[int, ...]:
-        query = 'SELECT version()'
-        res = connection.execute(sql.text(query)).scalar()
-        match = self.__version_pattern.match(res)
-        version = int(match.group(1)) if match else 0
-        return tuple([version])
+        try:
+            dbapi_connection: trino_dbapi.Connection = connection.connection
+            checkSQL="""SHOW FUNCTIONS LIKE 'version' """
+            res = dbapi_connection.execute(sql.text(checkSQL))
+            if res:
+                query = 'SELECT version()'
+                res = connection.exec_driver_sql(sql.text(query)).first()
+                match = self.__version_pattern.match(res.scalar())
+                version = int(match.group(1)) if match else 0
+                return tuple([version])
+        except error.TrinoUserError as e:
+            if(e.error_name != error.FUNCTION_NOT_FOUND):
+                raise e
+        except AttributeError as e:
+            pass        
+        return tuple([350])
 
     def _get_default_schema_name(self, connection: Connection) -> Optional[str]:
         dbapi_connection: trino_dbapi.Connection = connection.connection
         return dbapi_connection.schema
+
+    def _get_default_schema_with_catalog(self, connection: Connection) -> Optional[str]:
+        dbapi_connection: trino_dbapi.Connection = connection.connection
+        return f'{self.identifier_preparer.quote_identifier(self.default_catalog)}.{self.identifier_preparer.quote_identifier(dbapi_connection.schema)}'
 
     def do_execute(self, cursor: Cursor, statement: str, parameters: Tuple[Any, ...],
                    context: DefaultExecutionContext = None):
@@ -328,3 +372,13 @@ class TrinoDialect(DefaultDialect):
             return f'{schema_part}.{table_part}'
 
         return table_part
+
+    def _get_full_schema_name(self,schema,connection):
+            if schema is None:   
+                return self._get_default_schema_with_catalog(connection)
+            elif schema:
+                catalog_schema=schema.split('.')
+                if catalog_schema[0]!=schema:
+                    return self.identifier_preparer.quote_identifier(schema) 
+                else : 
+                    return f'{self.identifier_preparer.quote_identifier(self.default_catalog)}.{self.identifier_preparer.quote_identifier(schema)}'    
