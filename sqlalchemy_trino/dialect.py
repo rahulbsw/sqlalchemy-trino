@@ -123,28 +123,38 @@ class TrinoDialect(DefaultDialect):
 
     def _get_columns(self, connection: Connection,
                      table_name: str, schema: str = None, **kw) -> List[Dict[str, Any]]:
-        schema = schema or self._get_default_schema_name(connection)
-        query = dedent(f'''
-            SELECT
-                "column_name",
-                "column_default",
-                "is_nullable",
-                "data_type"
-            FROM "{self.default_catalog}"."information_schema"."columns"
-            WHERE "table_schema" = '{schema}' AND "table_name" = '{table_name}'
-            ORDER BY "ordinal_position" ASC
-        ''').strip()
-        res = connection.execute(sql.text(query))
-        columns = []
-        for record in res:
-            column = dict(
-                name=record.column_name,
-                type=datatype.parse_sqltype(record.data_type),
-                nullable=(record.is_nullable or '').upper() == 'YES',
-                default=record.column_default,
-            )
-            columns.append(column)
-        return columns
+        try:
+            schema = schema or self._get_default_schema_name(connection)
+            query = dedent(f'''
+                SELECT
+                    "column_name",
+                    "column_default",
+                    "is_nullable",
+                    "data_type"
+                FROM "{self.default_catalog}"."information_schema"."columns"
+                WHERE "table_schema" = '{schema}' AND "table_name" = '{table_name}'
+                ORDER BY "ordinal_position" ASC
+            ''').strip()
+            res = connection.execute(sql.text(query))
+            columns = []
+            for record in res:
+                column = dict(
+                    name=record.column_name,
+                    type=datatype.parse_sqltype(record.data_type),
+                    nullable=(record.is_nullable or '').upper() == 'YES',
+                    default=record.column_default,
+                )
+                columns.append(column)
+            return columns
+        except error.TrinoUserError or error.TrinoQueryError or error.TrinoExternalError as e:
+             if e.error_name in (
+                error.TABLE_NOT_FOUND,
+                error.SCHEMA_NOT_FOUND,
+                error.CATALOG_NOT_FOUND,
+                error.NOT_FOUND
+            ) or e.error_type==error.EXTERNAL_TYPE:
+                raise exc.NoSuchTableError(f'schema={schema}, table={table_name}') from e
+       
 
     def get_pk_constraint(self, connection: Connection,
                           table_name: str, schema: str = None, **kw) -> Dict[str, Any]:
@@ -200,18 +210,22 @@ class TrinoDialect(DefaultDialect):
 
     def get_view_definition(self, connection: Connection, view_name: str, schema: str = None, **kw) -> str:
         schema=self._get_full_schema_name(schema,connection)
-        full_view = self._get_full_table(view_name, schema,quote=False)
-        query = f'SHOW CREATE VIEW {full_view}'
+        query = dedent(f'''
+            SELECT "view_definition"
+            FROM "{self.default_catalog}"."information_schema"."views"
+            WHERE "table_schema" = '{schema}' and table_name='{view_name}'
+        ''').strip()
         try:
             res = connection.execute(sql.text(query))
             return res.scalar()
-        except error.TrinoQueryError as e:
+        except error.TrinoUserError or error.TrinoQueryError as e:
             if e.error_name in (
                 error.TABLE_NOT_FOUND,
                 error.SCHEMA_NOT_FOUND,
                 error.CATALOG_NOT_FOUND,
+                error.NOT_FOUND
             ):
-                raise exc.NoSuchTableError(full_view) from e
+                raise exc.NoSuchTableError(view_name) from e
             raise
         #return dict(text=None)
 
@@ -246,12 +260,13 @@ class TrinoDialect(DefaultDialect):
         try:
             res = connection.execute(sql.text(query))
             return dict(text=res.scalar())
-        except error.TrinoQueryError as e:
+        except error.TrinoUserError or error.TrinoQueryError as e:
             if e.error_name in (
-                error.NOT_FOUND,
                 error.COLUMN_NOT_FOUND,
                 error.TABLE_NOT_FOUND,
-                error.NOT_SUPPORTED
+                error.SCHEMA_NOT_FOUND,
+                error.CATALOG_NOT_FOUND,
+                error.NOT_FOUND
             ):
                 return dict(text=None)
             raise
@@ -262,11 +277,12 @@ class TrinoDialect(DefaultDialect):
         try:
             res = connection.execute(sql.text(query))
             return res.first() is not None
-        except error.TrinoQueryError as e:
+        except error.TrinoUserError or error.TrinoQueryError as e:
             if e.error_name in (
                 error.TABLE_NOT_FOUND,
                 error.SCHEMA_NOT_FOUND,
                 error.CATALOG_NOT_FOUND,
+                error.NOT_FOUND
             ):
                 return False
             raise
@@ -279,15 +295,19 @@ class TrinoDialect(DefaultDialect):
         try:
             res = connection.execute(sql.text(query))
             return res.first() is not None
-        except error.TrinoQueryError as e:
+        except error.TrinoUserError or error.TrinoQueryError as e:
             if e.error_name in (
                 error.TABLE_NOT_FOUND,
                 error.SCHEMA_NOT_FOUND,
                 error.CATALOG_NOT_FOUND,
-                error.MISSING_SCHEMA_NAME,
+                error.NOT_FOUND
             ):
                 return False
             raise
+
+    def has_view(self, connection: Connection,
+                  table_name: str, schema: str = None) -> bool:
+        return self.has_table(connection,table_name,schema) 
 
     def has_sequence(self, connection: Connection,
                      sequence_name: str, schema: str = None) -> bool:
